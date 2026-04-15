@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -81,10 +87,25 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	key := getAssetPath(mediaType)
+	var newKey string
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error determining the aspect ratio", err)
+		return
+	}
+
+	switch aspectRatio {
+	case "16:9":
+		newKey = filepath.Join("landscape", key)
+	case "9:16":
+		newKey = filepath.Join("portrait", key)
+	default:
+		newKey = filepath.Join("other", key)
+	}
 
 	input := &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
-		Key:         aws.String(key),
+		Key:         aws.String(newKey),
 		Body:        tempFile,
 		ContentType: aws.String(mediaType),
 	}
@@ -95,7 +116,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	newURL := cfg.getObjectURL(key)
+	newURL := cfg.getObjectURL(newKey)
 	video.VideoURL = &newURL
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
@@ -104,4 +125,46 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	var output struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams",
+		filePath)
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe error: %v", err)
+	}
+
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		return "", fmt.Errorf("could not parse ffprobe output: %v", err)
+	}
+
+	if len(output.Streams) == 0 {
+		return "", errors.New("no video streams found")
+	}
+
+	result := float64(output.Streams[0].Width) / float64(output.Streams[0].Height)
+	aspect := fmt.Sprintf("%.2f", result)
+	switch aspect {
+	case "1.78":
+		return "16:9", nil
+	case "0.56":
+		return "9:16", nil
+	default:
+		return "other", nil
+	}
 }
